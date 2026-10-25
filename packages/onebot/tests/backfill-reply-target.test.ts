@@ -23,9 +23,9 @@ const converterCtx = {
     mediaSegmentSink: null,
 } as any;
 
-function fakeStore(has = false) {
+function fakeStore(has = false, time?: number) {
     return {
-        findEvent: vi.fn(() => (has ? ({ message_id: 1 } as any) : null)),
+        findEvent: vi.fn(() => (has ? ({ message_id: 1, time } as any) : null)),
         storeMeta: vi.fn(),
         storeEvent: vi.fn(),
     };
@@ -238,7 +238,7 @@ describe('backfillReplyTarget', () => {
     });
 
     it('no-op when the quoted message is already stored (no fetch)', async () => {
-        const store = fakeStore(true); // findEvent hits
+        const store = fakeStore(true, 1); // findEvent hits; stored time matches quoted time
         const getGroupMessageBySeq = vi.fn();
         const ref = {
             selfId: SELF,
@@ -339,5 +339,55 @@ describe('backfillReplyTarget', () => {
             expect.objectContaining({ message_id: targetId, message_type: 'group' }),
             { sequenceAuthoritative: false },
         );
+    });
+
+    it('re-fetches when the stored event is a stale cross-day collision (group)', async () => {
+        // A reused cross-day clientSeq maps a *different* message onto the same
+        // targetId; the stored event's timestamp is far from the quoted time, so
+        // Tier 0 must not short-circuit — it has to re-fetch and overwrite.
+        const store = fakeStore(true, 100_000); // stale timestamp, far from event.time=1
+        const getGroupMessageBySeq = vi.fn(async () => fetchedGroupMessage(123));
+        const ref = {
+            selfId: SELF,
+            converterCtx,
+            messageStore: store,
+            bridge: { apis: { message: { getGroupMessageBySeq } }, resolveUserUid: vi.fn() },
+        } as any;
+
+        await backfillReplyTarget(ref, groupEvent(123));
+
+        expect(getGroupMessageBySeq).toHaveBeenCalledWith(700, 123, SELF);
+        expect(store.storeEvent).toHaveBeenCalled();
+    });
+
+    it('re-fetches when the stored event is a stale cross-day collision (c2c)', async () => {
+        const store = fakeStore(true, 1_700_000_000); // stale "last night" timestamp
+        const getC2cLatestHistory = vi.fn(async () => [fetchedFriendMessage(456, 448671521)]);
+        const resolveUserUid = vi.fn(async () => 'u_friend');
+        const ref = {
+            selfId: SELF,
+            converterCtx,
+            messageStore: store,
+            bridge: { apis: { message: { getC2cLatestHistory } }, resolveUserUid },
+        } as any;
+        const event = {
+            kind: 'friend_message',
+            time: 1_700_086_400,
+            selfUin: SELF,
+            senderUin: 448671521,
+            senderNick: '',
+            msgSeq: 999,
+            msgId: 2,
+            elements: [
+                // quoted message is from "today" (86400s after the stored stale time)
+                { type: 'reply', replySeq: 456, replyTime: 1_700_086_400 },
+                { type: 'text', text: '同意' },
+            ],
+        } as any;
+
+        await backfillReplyTarget(ref, event);
+
+        expect(resolveUserUid).toHaveBeenCalledWith(448671521);
+        expect(store.storeEvent).toHaveBeenCalled();
     });
 });

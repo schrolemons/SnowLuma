@@ -483,9 +483,22 @@ export async function backfillReplyTarget(ref: HistoryRef, event: QQEventVariant
             ? (resolvedId as number)
             : hashMessageIdInt32(replySeq, session, eventName);
 
-    if (await ref.messageStore.findEvent(targetId)) {
-        return;
-    } // Tier 0: already have the full event
+    const existingEvent = await ref.messageStore.findEvent(targetId);
+    if (existingEvent) {
+        // The reply id hash omits the timestamp, so a reused cross-day clientSeq
+        // can land a *different* message on the same targetId. Only skip the
+        // backfill when the stored event really is the message being quoted — i.e.
+        // its timestamp matches the quoted time. Otherwise treat it as a stale
+        // collision and let Tier 1 below re-fetch and overwrite.
+        const quotedTime =
+            reply?.replyTime && reply.replyTime > 0 ? reply.replyTime : event.time;
+        if (
+            typeof existingEvent.time === 'number' &&
+            Math.abs(existingEvent.time - quotedTime) < 21600
+        ) {
+            return;
+        }
+    } // Tier 0: already have the full event (and it's the right one)
 
     // Tier 1: fetch the quoted message from the server, keyed under the exact id
     // the reply resolves to. Groups can query `replySeq` directly. C2C replies
